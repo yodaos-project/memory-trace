@@ -150,9 +150,6 @@ static void record_list(size_t size, char *filename, int line, void *memory) {
   void *trace[BACKTRACE_DEEP];
   record->trace_size = backtrace(trace, BACKTRACE_DEEP);
   record->backtrace = backtrace_symbols(trace, record->trace_size);
-  for (uint32_t i = 2; i < record->trace_size; ++i) {
-    record->backtrace[i][0] = '0' + i - 2;
-  }
 
   list_node_t* record_node = list_node_create(record);
   list_push_back(&g_trace_list, record_node);
@@ -215,7 +212,7 @@ void print_trace() {
     printf("%s: %dL, %ld bytes\n", record->filename, record->line, record->size);
     // skip record_list and yoda_malloc backtrace
     for (uint32_t i = 2; i < record->trace_size; ++i) {
-      printf("%s\n", record->backtrace[i]);
+      printf("%d%s\n", i - 2, ++record->backtrace[i]);
     }
   }
   printf("total: %ldbytes\n", total);
