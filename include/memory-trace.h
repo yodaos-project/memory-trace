@@ -14,7 +14,7 @@ void* yoda_calloc(size_t number, size_t length, char *filename, int line);
 void* yoda_realloc(void *ptr, size_t length, char *filename, int line);
 void yoda_free(void *ptr_temp);
 void print_trace();
-void dump_json_trace(const char *filepath);
+int dump_trace_json(const char *filename);
 
 #define malloc(x) yoda_malloc((x), __FILE__, __LINE__)
 #define free(x) yoda_free((x))

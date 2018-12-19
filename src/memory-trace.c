@@ -10,6 +10,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <execinfo.h>
+#include <errno.h>
+
+#define LOG_INFO(...) fprintf(stdout, __VA_ARGS__)
+#define LOG_ERROR(...) fprintf(stderr, __VA_ARGS__)
 
 typedef struct list_node_s {
   struct list_node_s *prev;
@@ -123,16 +127,18 @@ typedef struct memory_record_s {
   size_t size;
   void *memory; // weak pointer
   char **backtrace;
-  int trace_size;
+  uint32_t trace_size;
 } memory_record_t;
 
-int record_cmp(void *v1, void *v2) {
+static int record_cmp(void *v1, void *v2) {
   void *memory1 = v1;
   void *memory2 = ((memory_record_t *) v2)->memory;
   return memory1 == memory2 ? 0 : 1;
 }
 
 #define BACKTRACE_DEEP 10
+#define JSON_OBJ_BUF_MAX 16 * 1024
+#define PROPERTY_BUF_MAX 512
 
 static list_t g_trace_list;
 static pthread_mutex_t g_acquire_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -182,7 +188,10 @@ void *yoda_realloc(void *ptr, size_t size, char *filename, int line) {
   return memory;
 }
 
-void yoda_basic_free(void *p) {
+void yoda_free(void *p) {
+  if (p == NULL) {
+    return;
+  }
   pthread_mutex_lock(&g_acquire_malloc_lock);
 
   list_node_t *node = list_find(&g_trace_list, p, record_cmp);
@@ -196,30 +205,109 @@ void yoda_basic_free(void *p) {
   free(p);
 }
 
-void yoda_free(void *p) {
-  if (p != NULL) {
-    yoda_basic_free(p);
-  }
-}
-
 void print_trace() {
-  pthread_mutex_lock(&g_acquire_malloc_lock);
   size_t total = 0;
-  printf("-----------------------------------\n");
+  pthread_mutex_lock(&g_acquire_malloc_lock);
+  LOG_INFO("-----------------------------------\n");
   LIST_FOREACH(&g_trace_list, node) {
     memory_record_t *record = NODE_DATA(node, memory_record_t);
     total += record->size;
-    printf("%s: %dL, %ld bytes\n", record->filename, record->line, record->size);
+    LOG_INFO("%s: %dL, %ld bytes\n",
+      record->filename, record->line, record->size);
     // skip record_list and yoda_malloc backtrace
     for (uint32_t i = 2; i < record->trace_size; ++i) {
-      printf("%d%s\n", i - 2, ++record->backtrace[i]);
+      LOG_INFO("%s\n", ++record->backtrace[i]);
     }
   }
-  printf("total: %ldbytes\n", total);
   pthread_mutex_unlock(&g_acquire_malloc_lock);
+  LOG_INFO("total: %ld bytes\n", total);
 }
 
-void dump_trace_json(const char *filepath) {
+static void do_flush(FILE *file, char *buf, char **buf_start) {
+  size_t buf_size = *buf_start - buf;
+  if (buf_size > 0) {
+    fwrite(buf, buf_size, 1, file);
+    *buf_start = buf;
+  }
+}
+
+static int flush_buf(FILE *file, char *buf, char **buf_start,
+                     char *buf_end, const char *src, int force) {
+  size_t src_len = strlen(src);
+  size_t buf_left_len = buf_end - *buf_start;
+  if (buf_left_len < src_len) {
+    if (*buf_start == buf) {
+      LOG_ERROR("write src is too long before flush: %ld", src_len);
+      return 2;
+    }
+    do_flush(file, buf, buf_start);
+    buf_left_len = buf_end - *buf_start;
+    if (buf_left_len < src_len) {
+      LOG_ERROR("write src is too long after flush: %ld", src_len);
+      return 3;
+    }
+  }
+  if (force) {
+    do_flush(file, buf, buf_start);
+    fwrite(src, src_len, 1, file);
+  } else {
+    memcpy(*buf_start, src, src_len);
+    *buf_start += src_len;
+  }
+  #undef DO_WRITE
+  return 0;
+}
+
+int dump_trace_json(const char *filename) {
+  FILE *file = fopen(filename, "w");
+  if (!file) {
+    char *err = strerror(errno);
+    LOG_ERROR("open %s error: %s", filename, err);
+    return errno;
+  }
+  char *obj_buf = (char *) malloc(JSON_OBJ_BUF_MAX);
+  char *buf_start = obj_buf;
+  char *buf_end = obj_buf + JSON_OBJ_BUF_MAX - 1;
+  char property_buf[PROPERTY_BUF_MAX];
+  int r = 0;
+
+  #define WRITE_PROPERTY_BUF(format, value)                                    \
+    snprintf(property_buf, PROPERTY_BUF_MAX, format, value);                   \
+    r = flush_buf(file, obj_buf, &buf_start, buf_end, property_buf, 0);        \
+    if (r != 0) {                                                              \
+      break;                                                                   \
+    }
+
   pthread_mutex_lock(&g_acquire_malloc_lock);
+  fwrite("[", 1, 1, file);
+  LIST_FOREACH(&g_trace_list, node) {
+    memory_record_t *record = NODE_DATA(node, memory_record_t);
+    WRITE_PROPERTY_BUF("{\"filename:\":\"%s\",", record->filename);
+    WRITE_PROPERTY_BUF("\"line:\":%d,", record->line);
+    WRITE_PROPERTY_BUF("\"size:\":%ld,", record->size);
+    WRITE_PROPERTY_BUF("\"backtrace:\":[%s", "");
+    for (uint32_t i = 2; i < record->trace_size; ++i) {
+      if (i < record->trace_size -1) {
+        WRITE_PROPERTY_BUF("\"%s\",", ++record->backtrace[i]);
+      } else {
+        if (node->next) {
+          WRITE_PROPERTY_BUF("\"%s\"]},", ++record->backtrace[i]);
+        } else {
+          WRITE_PROPERTY_BUF("\"%s\"]}", ++record->backtrace[i]);
+        }
+      }
+    }
+  }
+  #undef SPRINTF_PROPERTY
+  if (r == 0) {
+    flush_buf(file, obj_buf, &buf_start, buf_end, "]", 1);
+    fclose(file);
+  } else {
+    LOG_ERROR("write json error code: %d", r);
+    fclose(file);
+    unlink(filename);
+  }
+  free(obj_buf);
   pthread_mutex_unlock(&g_acquire_malloc_lock);
+  return r;
 }

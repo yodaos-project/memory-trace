@@ -5,6 +5,7 @@
 #include "memory-trace.h"
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #define fast_malloc(var, T, count) T *var = (T *) malloc(sizeof(T) * count)
 #define fast_free(var) free(var); var = NULL;
@@ -59,7 +60,8 @@ int main(int argc, char **argv) {
   foo2();
   print_trace();
   foo3();
-  print_trace();
+  int r = dump_trace_json("data.json");
+  assert(r == 0);
   
   return 0;
 }

@@ -1,13 +1,18 @@
 # memory-trace
-take C/C++ heap snapshot, currently supported the following features:
+take C/C++ heap snapshot. Currently supports the following features:
 - file and line number
 - backtrace call stack, up to 10 stacktraces
+- export backtrace to json
 
-## usage
+## build
 1. add `./include/memory-trace.h` to your headers
-2. add `./src/memory-trace.c(or .cc)` to your C or C++ compile list, you can also compile the source and load it via dynamic linking
+2. add `./src/memory-trace.c(or .cc)` to your C(or C++) compile list, you can also compile the source and load it via dynamic linking
 3. add `set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -rdynamic")` to your CMakeLists.txt
-4. call `print_trace()` to print current memory trace, the following content will be printed:
+4. don't `strip` your executable or lib, otherwise symbol information can't be obtained
+
+## API
+- `void print_trace()`
+print current memory trace, the following content will be printed:
 ```shell
 ./samples/c/sample.c: 20L, 12 bytes
 0   sample-c                            0x00000001014023d0 bar1 + 32
@@ -29,3 +34,6 @@ take C/C++ heap snapshot, currently supported the following features:
 5   ???                                 0x0000000000000001 0x0 + 1
 total: 92bytes
 ```
+
+- `int dump_trace_json(const char *filename)`
+dump trace to a json file
