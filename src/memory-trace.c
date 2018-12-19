@@ -259,6 +259,7 @@ static int flush_buf(FILE *file, char *buf, char **buf_start,
 }
 
 int dump_trace_json(const char *filename) {
+  pthread_mutex_lock(&g_acquire_malloc_lock);
   FILE *file = fopen(filename, "w");
   if (!file) {
     char *err = strerror(errno);
@@ -278,7 +279,6 @@ int dump_trace_json(const char *filename) {
       break;                                                                   \
     }
 
-  pthread_mutex_lock(&g_acquire_malloc_lock);
   fwrite("[", 1, 1, file);
   LIST_FOREACH(&g_trace_list, node) {
     memory_record_t *record = NODE_DATA(node, memory_record_t);
