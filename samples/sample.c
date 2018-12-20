@@ -2,7 +2,6 @@
 // Created by ximin.chen@rokid.com on 2018/12/17.
 //
 
-#include "memory-trace.h"
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -40,6 +39,8 @@ void foo3() {
 }
 
 int main(int argc, char **argv) {
+  int r;
+  r = dump_trace_json("data.json");
   fast_malloc(p1, char, 12);
   fast_malloc(p2, int, 2);
   fast_malloc(p3, double, 3);
@@ -48,19 +49,19 @@ int main(int argc, char **argv) {
   *(p3 + 1) = 4.0;
   *(p4 + 2) = 5.0f;
   printf("p2: %d, p3: %f, p4: %fi\n", *p2, *(p3 + 1), *(p4 + 2));
-  print_trace();
+  // print_trace();
   fast_free(p2);
   fast_free(p3);
   fast_free(p4);
-  print_trace();
+  // print_trace();
   free(p1);
-  print_trace();
+  // print_trace();
   foo1();
-  print_trace();
+  // print_trace();
   foo2();
-  print_trace();
+  // print_trace();
   foo3();
-  int r = dump_trace_json("data.json");
+  // r = dump_trace_json("data.json");
   assert(r == 0);
   
   return 0;

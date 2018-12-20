@@ -11,9 +11,23 @@
 #include <stdio.h>
 #include <execinfo.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 #define LOG_INFO(...) fprintf(stdout, __VA_ARGS__)
 #define LOG_ERROR(...) fprintf(stderr, __VA_ARGS__)
+
+#ifdef __cplusplus
+#define BACKTRACE_SKIP 4
+#else
+#define BACKTRACE_SKIP 2
+#endif
+
+static void* (*real_malloc)(size_t size) = NULL;
+static void* (*real_calloc)(size_t number, size_t size) = NULL;
+static void* (*real_realloc)(void *ptr, size_t number) = NULL;
+static void* (*real_free)(void *ptr) = NULL;
+
+void print_trace();
 
 typedef struct list_node_s {
   struct list_node_s *prev;
@@ -28,7 +42,7 @@ typedef struct list_s {
 } list_t;
 
 static list_t *list_create() {
-  list_t *self = (list_t *) malloc(sizeof(list_t));
+  list_t *self = (list_t *) real_malloc(sizeof(list_t));
   self->head = NULL;
   self->tail = NULL;
   self->length = 0;
@@ -36,7 +50,7 @@ static list_t *list_create() {
 }
 
 static list_node_t *list_node_create(void *data) {
-  list_node_t *node = (list_node_t *) malloc(sizeof(list_node_t));
+  list_node_t *node = (list_node_t *) real_malloc(sizeof(list_node_t));
   node->prev = NULL;
   node->next = NULL;
   node->data = data;
@@ -50,12 +64,12 @@ static void list_destroy(list_t *list) {
 
   while (len--) {
     next = node->next;
-    free(node->data);
-    free(node);
+    real_free(node->data);
+    real_free(node);
     node = next;
   }
 
-  free(list);
+  real_free(list);
 }
 
 static list_node_t *list_push_back(list_t *list, list_node_t *node) {
@@ -96,8 +110,8 @@ static void list_remove(list_t *list, list_node_t *node) {
 
   node->next ? (node->next->prev = node->prev) : (list->tail = node->prev);
 
-  free(node->data);
-  free(node);
+  real_free(node->data);
+  real_free(node);
   --list->length;
 }
 
@@ -143,14 +157,14 @@ static int record_cmp(void *v1, void *v2) {
 static list_t g_trace_list;
 static pthread_mutex_t g_acquire_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void record_list(size_t size, char *filename, int line, void *memory) {
+static void record_list(size_t size, const char *filename, int line, void *memory) {
   pthread_mutex_lock(&g_acquire_malloc_lock);
   size_t filename_length = strlen(filename);
-  memory_record_t *record = (memory_record_t *) malloc(sizeof(memory_record_t));
+  memory_record_t *record = (memory_record_t *) real_malloc(sizeof(memory_record_t));
   record->memory = memory;
   record->size = size;
   record->line = line;
-  record->filename = (char *) malloc(filename_length + 1);
+  record->filename = (char *) real_malloc(filename_length + 1);
   memcpy(record->filename, filename, filename_length);
   record->filename[filename_length] = '\0';
   void *trace[BACKTRACE_DEEP];
@@ -160,49 +174,64 @@ static void record_list(size_t size, char *filename, int line, void *memory) {
   list_node_t* record_node = list_node_create(record);
   list_push_back(&g_trace_list, record_node);
   pthread_mutex_unlock(&g_acquire_malloc_lock);
+  print_trace();
 }
 
-void *yoda_malloc(size_t size, char *filename, int line) {
-  void *memory = malloc(size);
+#define LOAD_REAL(var, name)\
+  pthread_mutex_lock(&g_acquire_malloc_lock); \
+  var = dlsym(RTLD_NEXT, name);\
+  if (var == NULL) {   \
+    LOG_ERROR("load %s error: %s\n", name, dlerror());\
+  } else {\
+    LOG_INFO("loaded %s\n", name);\
+  } \
+  pthread_mutex_unlock(&g_acquire_malloc_lock);
+
+void *malloc(size_t size) {
+  LOAD_REAL(real_malloc, "malloc");
+  void *memory = real_malloc(size);
 
   if (NULL != memory) {
-    record_list(size, filename, line, memory);
+    record_list(size, "", 0, memory);
   }
 
   return memory;
 }
 
-void *yoda_calloc(size_t number, size_t size, char *filename, int line) {
-  void *memory = calloc(number, size);
+void *calloc(size_t number, size_t size) {
+  LOAD_REAL(real_calloc, "calloc");
+  void *memory = real_calloc(number, size);
   if (memory != NULL) {
-    record_list(size * number, filename, line, memory);
+    record_list(size * number, "", 0, memory);
   }
   return memory;
 }
 
-void *yoda_realloc(void *ptr, size_t size, char *filename, int line) {
-  void *memory = realloc(ptr, size);
+void *realloc(void *ptr, size_t size) {
+  LOAD_REAL(real_realloc, "realloc");
+  void *memory = real_realloc(ptr, size);
   if (memory != NULL) {
-    record_list(size, filename, line, memory);
+    record_list(size, "", 0, memory);
   }
   return memory;
 }
 
-void yoda_free(void *p) {
+void free(void *p) {
   if (p == NULL) {
     return;
   }
+  LOAD_REAL(real_free, "free");
   pthread_mutex_lock(&g_acquire_malloc_lock);
 
   list_node_t *node = list_find(&g_trace_list, p, record_cmp);
   if (node != NULL) {
     memory_record_t *record = NODE_DATA(node, memory_record_t);
-    free(record->filename);
-    free(record->backtrace);
+    real_free(record->filename);
+    real_free(record->backtrace);
     list_remove(&g_trace_list, node);
   }
   pthread_mutex_unlock(&g_acquire_malloc_lock);
-  free(p);
+  real_free(p);
 }
 
 void print_trace() {
@@ -215,7 +244,7 @@ void print_trace() {
     LOG_INFO("%s: %dL, %ld bytes\n",
       record->filename, record->line, record->size);
     // skip record_list and yoda_malloc backtrace
-    for (uint32_t i = 2; i < record->trace_size; ++i) {
+    for (uint32_t i = BACKTRACE_SKIP; i < record->trace_size; ++i) {
       LOG_INFO("%s\n", ++record->backtrace[i]);
     }
   }
@@ -266,7 +295,7 @@ int dump_trace_json(const char *filename) {
     LOG_ERROR("open %s error: %s", filename, err);
     return errno;
   }
-  char *obj_buf = (char *) malloc(JSON_OBJ_BUF_MAX);
+  char obj_buf[JSON_OBJ_BUF_MAX];
   char *buf_start = obj_buf;
   char *buf_end = obj_buf + JSON_OBJ_BUF_MAX - 1;
   char property_buf[PROPERTY_BUF_MAX];
@@ -286,7 +315,7 @@ int dump_trace_json(const char *filename) {
     WRITE_PROPERTY_BUF("\"line:\":%d,", record->line);
     WRITE_PROPERTY_BUF("\"size:\":%ld,", record->size);
     WRITE_PROPERTY_BUF("\"backtrace:\":[%s", "");
-    for (uint32_t i = 2; i < record->trace_size; ++i) {
+    for (uint32_t i = BACKTRACE_SKIP; i < record->trace_size; ++i) {
       if (i < record->trace_size -1) {
         WRITE_PROPERTY_BUF("\"%s\",", ++record->backtrace[i]);
       } else {
@@ -307,7 +336,6 @@ int dump_trace_json(const char *filename) {
     fclose(file);
     unlink(filename);
   }
-  free(obj_buf);
   pthread_mutex_unlock(&g_acquire_malloc_lock);
   return r;
 }
