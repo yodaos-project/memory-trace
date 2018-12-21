@@ -238,7 +238,7 @@ test_atexit(void)
 int
 main(int argc, char *argv[])
 {
- /*  test_dlsym();
+   test_dlsym();
    test_malloc();
    test_calloc();
    test_realloc();
@@ -246,11 +246,9 @@ main(int argc, char *argv[])
    test_cxx();
    test_string();
    test_subprocess();
-   std::vector<TestGlobal *> v;
-   v.push_back(new TestGlobal);
 
    atexit(test_atexit);
-*/
+
    return 0;
 }
 

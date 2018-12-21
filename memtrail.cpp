@@ -1,3 +1,29 @@
+/**************************************************************************
+ *
+ * Copyright 2011-2014 Jose Fonseca
+ * All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ **************************************************************************/
+
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -108,6 +134,117 @@ libunwind_backtrace(unw_context_t *uc, void **buffer, int size)
    return count;
 }
 
+
+static char progname[PATH_MAX] = {0};
+
+
+/**
+ * Just like dladdr() but without holding lock.
+ *
+ * Calling dladdr() will dead-lock when another thread is doing dlopen() and
+ * the newly loaded shared-object's global constructors call malloc.
+ *
+ * See also glibc/elf/rtld-debugger-interface.txt
+ */
+static int
+_dladdr (const void *address, Dl_info *info) {
+   struct link_map * lm = _r_debug.r_map;
+   ElfW(Addr) addr = (ElfW(Addr)) address;
+
+   /* XXX: we're effectively replacing odds of deadlocking with the odds of a
+    * race condition when a new shared library is opened.  We should keep a
+    * cache of this info to improve our odds.
+    *
+    * Another alternative would be to use /self/proc/maps
+    */
+   if (_r_debug.r_state != r_debug::RT_CONSISTENT) {
+      fprintf(stderr, "memtrail: warning: inconsistent r_debug state\n");
+   }
+
+   if (0) fprintf(stderr, "0x%lx:\n", addr);
+
+   assert(lm->l_prev == 0);
+   while (lm->l_prev) {
+      lm = lm->l_prev;
+   }
+
+   while (lm) {
+
+      ElfW(Addr) l_addr;
+      const char *l_name;
+      if (lm->l_addr) {
+         // Shared-object
+         l_addr = lm->l_addr;
+         l_name = lm->l_name;
+      } else {
+         // Main program
+#if defined(__i386__)
+         l_addr = 0x08048000;
+#elif defined(__x86_64__)
+         l_addr = 0x400000;
+#elif defined(__aarch64__)
+         l_addr = 0x400000;
+#else
+#error
+#endif
+         l_name = lm->l_name;
+      }
+
+      assert(l_name != nullptr);
+      if (l_name[0] == 0 && lm == _r_debug.r_map) {
+         // Determine the absolute path to progname
+         if (progname[0] == 0) {
+            size_t len = readlink("/proc/self/exe", progname, sizeof progname - 1);
+            if (len <= 0) {
+               strncpy(progname, program_invocation_name, PATH_MAX);
+               len = PATH_MAX - 1;
+            }
+            progname[len] = 0;
+         }
+         l_name = progname;
+      }
+
+      if (0) fprintf(stderr, "  0x%p, 0x%lx, %s\n", lm, l_addr, l_name);
+      const ElfW(Ehdr) *l_ehdr = (const ElfW(Ehdr) *)l_addr;
+      const ElfW(Phdr) *l_phdr = (const ElfW(Phdr) *)(l_addr + l_ehdr->e_phoff);
+      for (int i = 0; i < l_ehdr->e_phnum; ++i) {
+         if (l_phdr[i].p_type == PT_LOAD) {
+            ElfW(Addr) start = lm->l_addr + l_phdr[i].p_vaddr;
+            ElfW(Addr) stop = start + l_phdr[i].p_memsz;
+
+            if (0) fprintf(stderr, "    0x%lx-0x%lx \n", start, stop);
+            if (start <= addr && addr < stop) {
+               info->dli_fname = l_name;
+               info->dli_fbase = (void *)l_addr;
+               info->dli_sname = NULL;
+               info->dli_saddr = NULL;
+               return 1;
+            }
+         }
+      }
+
+      lm = lm->l_next;
+   }
+
+   if (0) {
+      int fd = open("/proc/self/maps", O_RDONLY);
+      do {
+         char buf[512];
+         size_t nread = read(fd, buf, sizeof buf);
+         if (!nread) {
+            break;
+         }
+         ssize_t nwritten;
+         nwritten = write(STDERR_FILENO, buf, nread);
+         (void)nwritten;
+      } while (true);
+      close(fd);
+   }
+
+   return 0;
+}
+
+
 struct header_t {
    struct list_head list_head;
 
@@ -141,6 +278,210 @@ limit_size = SSIZE_MAX;
 struct list_head
 hdr_list = { &hdr_list, &hdr_list };
 
+static int fd = -1;
+
+
+
+struct Module {
+   const char *dli_fname;
+   void       *dli_fbase;
+};
+
+static Module modules[MAX_MODULES];
+static unsigned numModules = 0;
+
+struct Symbol {
+   void *addr;
+   Module *module;
+};
+
+static Symbol symbols[MAX_SYMBOLS];
+
+
+
+class PipeBuf
+{
+protected:
+   int _fd;
+   char _buf[PIPE_BUF];
+   size_t _written;
+
+public:
+   inline
+   PipeBuf(int fd) :
+      _fd(fd),
+      _written(0)
+   {
+      assert(fd >= 0);
+   }
+
+   inline void
+   write(const void *buf, size_t nbytes) {
+      if (!RECORD) {
+         return;
+      }
+
+      if (nbytes) {
+         assert(_written + nbytes <= PIPE_BUF);
+         memcpy(_buf + _written, buf, nbytes);
+         _written += nbytes;
+      }
+   }
+
+   inline void
+   flush(void) {
+      if (!RECORD) {
+         return;
+      }
+
+      if (_written) {
+         ssize_t ret;
+         ret = ::write(_fd, _buf, _written);
+         assert(ret >= 0);
+         assert((size_t)ret == _written);
+         _written = 0;
+      }
+   }
+
+
+   inline
+   ~PipeBuf(void) {
+      flush();
+   }
+};
+
+
+static void
+_lookup(PipeBuf &buf, void *addr) {
+   unsigned key = (size_t)addr % MAX_SYMBOLS;
+
+   Symbol *sym = &symbols[key];
+
+   bool newModule = false;
+
+   if (sym->addr != addr) {
+      Dl_info info;
+      if (_dladdr(addr, &info)) {
+         Module *module = NULL;
+         for (unsigned i = 0; i < numModules; ++i) {
+            if (strcmp(modules[i].dli_fname, info.dli_fname) == 0) {
+               module = &modules[i];
+               break;
+            }
+         }
+         if (!module && numModules < ARRAY_SIZE(modules)) {
+            module = &modules[numModules++];
+            module->dli_fname = info.dli_fname;
+            module->dli_fbase = info.dli_fbase;
+            newModule = true;
+         }
+         sym->module = module;
+      } else {
+         sym->module = NULL;
+      }
+
+      sym->addr = addr;
+   }
+
+   size_t offset;
+   const char * name;
+   unsigned char moduleNo;
+
+   if (sym->module) {
+      name = sym->module->dli_fname;
+      offset = ((size_t)addr - (size_t)sym->module->dli_fbase);
+      moduleNo = 1 + sym->module - modules;
+   } else {
+      name = "";
+      offset = (size_t)addr;
+      moduleNo = 0;
+   }
+
+   buf.write(&addr, sizeof addr);
+   buf.write(&offset, sizeof offset);
+   buf.write(&moduleNo, sizeof moduleNo);
+   if (newModule) {
+      size_t len = strlen(name);
+      buf.write(&len, sizeof len);
+      buf.write(name, len);
+   }
+}
+
+
+enum
+{
+   READ_FD  = 0,
+   WRITE_FD = 1
+};
+
+static void
+_open(void) {
+   if (fd < 0) {
+      mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+      printf("open file\n");
+      fd = open("memtrail.data", O_WRONLY | O_CREAT | O_TRUNC, mode);
+
+      if (fd < 0) {
+         fprintf(stderr, "memtrail: error: could not open memtrail.data\n");
+         abort();
+      }
+
+      unsigned char c = sizeof(void *);
+      ssize_t ret;
+      ret = ::write(fd, &c, sizeof c);
+      assert(ret >= 0);
+      assert((size_t)ret == sizeof c);
+   }
+}
+
+
+static inline void
+_log(struct header_t *hdr) {
+   const void *ptr = hdr->ptr;
+   ssize_t ssize = hdr->allocated ? (ssize_t)hdr->size : -(ssize_t)hdr->size;
+
+   assert(ptr);
+   assert(ssize);
+
+   _open();
+
+   PipeBuf buf(fd);
+   buf.write(&ptr, sizeof ptr);
+   buf.write(&ssize, sizeof ssize);
+
+   if (hdr->allocated) {
+      unsigned char c = (unsigned char) hdr->addr_count;
+      buf.write(&c, 1);
+
+      for (size_t i = 0; i < hdr->addr_count; ++i) {
+         void *addr = hdr->addrs[i];
+         _lookup(buf, addr);
+      }
+   }
+}
+
+static void
+_flush(void) {
+   struct header_t *it;
+   struct header_t *tmp;
+   for (it = (struct header_t *)hdr_list.next,
+	     tmp = (struct header_t *)it->list_head.next;
+        &it->list_head != &hdr_list;
+	     it = tmp, tmp = (struct header_t *)tmp->list_head.next) {
+      assert(it->pending);
+      if (0) fprintf(stderr, "flush %p %zu\n", &it[1], it->size);
+      if (!it->internal) {
+         _log(it);
+      }
+      list_del(&it->list_head);
+      if (!it->allocated) {
+         __libc_free(it->ptr);
+      } else {
+         it->pending = false;
+      }
+   }
+}
+
 static inline void
 init(struct header_t *hdr,
      size_t size,
@@ -155,32 +496,6 @@ init(struct header_t *hdr,
 
    if (RECORD) {
       hdr->addr_count = libunwind_backtrace(uc, hdr->addrs, ARRAY_SIZE(hdr->addrs));
-   }
-}
-
-static inline void
-_log(struct header_t *hdr) {
-}
-
-static void
-_flush(void) {
-   struct header_t *it;
-   struct header_t *tmp;
-   for (it = (struct header_t *)hdr_list.next,
-	     tmp = (struct header_t *)it->list_head.next;
-        &it->list_head != &hdr_list;
-	     it = tmp, tmp = (struct header_t *)tmp->list_head.next) {
-      assert(it->pending);
-      fprintf(stderr, "flush %p %zu\n", &it[1], it->size);
-      if (!it->internal) {
-         _log(it);
-      }
-      list_del(&it->list_head);
-      if (!it->allocated) {
-         __libc_free(it->ptr);
-      } else {
-         it->pending = false;
-      }
    }
 }
 
@@ -272,7 +587,7 @@ _memalign(size_t alignment, size_t size, unw_context_t *uc)
    init(hdr, size, ptr, uc);
    res = &hdr[1];
    assert(((size_t)res & (alignment - 1)) == 0);
-   fprintf(stderr, "alloc %p %zu\n", res, size);
+   if (0) fprintf(stderr, "alloc %p %zu\n", res, size);
 
    _update(hdr);
 
@@ -299,7 +614,7 @@ _free(void *ptr)
 
    _update(hdr, false);
 
-   fprintf(stderr, "free %p %zu\n", ptr, hdr->size);
+   if (0) fprintf(stderr, "free %p %zu\n", ptr, hdr->size);
 }
 
 
@@ -577,6 +892,14 @@ memtrail_snapshot(void) {
 
    _flush();
 
+   _open();
+
+   static const void *ptr = NULL;
+   static const ssize_t size = 0;
+   PipeBuf buf(fd);
+   buf.write(&ptr, sizeof ptr);
+   buf.write(&size, sizeof size);
+
    size_t current_total_size = total_size;
    size_t current_delta_size;
    if (snapshot_no)
@@ -592,6 +915,7 @@ memtrail_snapshot(void) {
    fprintf(stderr, "memtrail: snapshot %zi bytes (%+zi bytes)\n", current_total_size, current_delta_size);
 }
 
+
 /*
  * Constructor/destructor
  */
@@ -601,9 +925,9 @@ __attribute__ ((constructor(101)))
 static void
 on_start(void)
 {
-   printf("start trace\n");
    // Only trace the current process.
    unsetenv("LD_PRELOAD");
+   _open();
 
    // Abort when the application allocates half of the physical memory, to
    // prevent the system from slowing down to a halt due to swapping
@@ -618,7 +942,6 @@ __attribute__ ((destructor(101)))
 static void
 on_exit(void)
 {
-   printf("exit trace\n");
    pthread_mutex_lock(&mutex);
    _flush();
    size_t current_max_size = max_size;
