@@ -1,0 +1,961 @@
+#!/usr/bin/env python
+##########################################################################
+#
+# Copyright 2011-2014 Jose Fonseca
+# All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+##########################################################################/
+
+
+import json
+import optparse
+import os.path
+import re
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+
+
+class OptionParser(optparse.OptionParser):
+
+    def parse_args(self, args):
+        # Skip option parsing when there are no options.  This prevents optparse
+        # from complaining about "-foo" when parsing "bla ble -foo"
+        if args and args[0].startswith('-'):
+            return optparse.OptionParser.parse_args(self, args)
+        else:
+            options, _ = optparse.OptionParser.parse_args(self, [])
+            return options, args
+
+
+##########################################################################
+# record
+
+
+signal_names = dict(
+    (getattr(signal, name), name)
+    for name in dir(signal)
+    if name.startswith('SIG') and '_' not in name
+)
+
+
+def record(args):
+    '''Run a command and record its allocations into memtrail.data'''
+
+    optparser = OptionParser(
+        usage="\n\t%prog record [options] -- program [args] ...")
+    optparser.add_option(
+        '-d', '--debug',
+        action="store_true",
+        dest="debug", default=False,
+        help="debug with gdb")
+    optparser.add_option(
+        '-p', '--profile',
+        action="store_true",
+        dest="profile", default=False,
+        help="profile with perf")
+    (options, args) = optparser.parse_args(args)
+
+    if not args:
+        optparser.error('insufficient number of arguments')
+
+    ld_preload = os.path.abspath(os.path.join(os.path.dirname(__file__), 'libmemtrail.so'))
+    if not os.path.exists(ld_preload):
+        sys.error.write('memtrail: error: %s not found\n' % ld_preload)
+        sys.exit(1)
+
+    if options.debug:
+        # http://stackoverflow.com/questions/4703763/how-to-run-gdb-with-ld-preload
+        cmd = [
+            'gdb',
+            '--ex', 'set exec-wrapper env LD_PRELOAD=%s' % ld_preload,
+            '--args'
+        ] + args
+        env = None
+    elif options.profile:
+        cmd = [
+            'perf', 'record', '-g',
+            'env', 'LD_PRELOAD=%s' % ld_preload,
+        ] + args
+        env = None
+    else:
+        cmd = args
+        env = os.environ.copy()
+        env['LD_PRELOAD'] = ld_preload
+
+    p = subprocess.Popen(cmd, env=env)
+    try:
+        retcode = p.wait()
+    except KeyboardInterrupt:
+        p.send_signal(signal.SIGINT)
+        retcode = p.wait()
+
+    if retcode < 0:
+        try:
+            signal_name = signal_names[-retcode]
+        except KeyError:
+            pass
+        else:
+            sys.stderr.write('%s\n' % signal_name)
+
+    sys.exit(retcode)
+
+
+
+##########################################################################
+# report
+
+
+NO_FUNCTION = '??'
+
+
+def _ignore_sigint():
+    # Prevent subprocesses from receiving ctrl-c
+    # http://stackoverflow.com/questions/5045771/python-how-to-prevent-subprocesses-from-receiving-ctrl-c-control-c-sigint
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+class Module:
+
+    def __init__(self, path):
+        self.path = path
+        self._path = os.path.abspath(path)
+
+        self.mime_type = subprocess.check_output(['file', '--dereference', '--brief', '--mime-type', self._path]).strip()
+        if self.mime_type not in ('application/x-executable', 'application/x-sharedlib'):
+            sys.stderr.write('memtrail: warning: unexpected mime-type %s for %s\n' % (self.mime_type, path))
+
+        self.addr2line = None
+
+    def lookup(self, addr, offset):
+
+        if self.mime_type == 'application/x-executable':
+            # use absolute addresses for executables
+            _addr = addr
+        elif self.mime_type == 'application/x-sharedlib':
+            # use relative offset for shared objects
+            _addr = offset
+        else:
+            return NO_FUNCTION, NO_FUNCTION + ':0'
+
+        if self.addr2line is None:
+            cmd = [
+                    'addr2line',
+                    '-e', self._path,
+                    '-f',
+                    '-C',
+            ]
+            self.addr2line = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, preexec_fn=_ignore_sigint)
+        p = self.addr2line
+
+        if p.returncode is not None:
+            return NO_FUNCTION, NO_FUNCTION + ':0'
+
+        self.addr2line.stdin.write('0x%x\n' % _addr)
+        function = self.addr2line.stdout.readline().strip()
+        line = self.addr2line.stdout.readline().strip()
+
+        return function, line
+
+
+class Symbol(object):
+
+    _moduleCache = {
+        None: None,
+    }
+
+    _cwd = os.getcwd() + os.path.sep
+
+    __slots__ = [
+        'addr',
+        'modulePath',
+        'offset',
+        '_function',
+        '_line',
+    ]
+
+    def __init__(self, addr, modulePath, offset):
+        self.addr = addr
+        self.modulePath = modulePath
+        
+        self.offset = offset
+        self._function = None
+        self._line = '??:0'
+
+    def _resolve(self):
+        if self._function is None:
+            self._function = NO_FUNCTION
+
+            try:
+                module = self._moduleCache[self.modulePath]
+            except KeyError:
+                module = Module(self.modulePath)
+            self._moduleCache[self.modulePath] = module
+
+            if module:
+                self._function, self._line = module.lookup(self.addr, self.offset)
+        assert self._function is not None
+
+    def function(self):
+        self._resolve()
+        return self._function
+
+    def id(self):
+        self._resolve()
+        if self._function != NO_FUNCTION:
+            return '%s!%s' % (self.modulePath, self._function)
+        return self.addr
+
+    def __str__(self):
+        self._resolve()
+        if self._function != NO_FUNCTION:
+            moduleName = os.path.basename(self.modulePath)
+            if moduleName != 'libmemtrail.so':
+                filename, lineNo = self._line.split(':', 1)
+                if filename != NO_FUNCTION:
+                    if filename.startswith(self._cwd):
+                        filename = filename[len(self._cwd):]
+                    return '%s [%s:%s]' % (self._function, filename, lineNo)
+            return self._function
+        elif self.modulePath is not None:
+            return '%s+0x%x' % (self.modulePath, self.offset)
+        else:
+            return '0x%x' % self.addr
+
+
+class SymbolTable:
+
+    def __init__(self):
+        self.symbols = {}
+
+    def addSymbol(self, address, modulePath, offset):
+        try:
+            symbol = self.symbols[address]
+        except KeyError:
+            self.symbols[address] = Symbol(address, modulePath, offset)
+        else:
+            assert modulePath == symbol.modulePath
+            assert offset == symbol.offset
+
+    def getSymbol(self, address):
+        return self.symbols[address]
+
+
+class Allocation(object):
+
+    __slots__ = [
+        'address',
+        'size',
+        'frames',
+    ]
+
+    def __init__(self, address, size, frames):
+        self.address = address
+        self.size = size
+        self.frames = frames
+
+    def __str__(self):
+        return '0x%X+%%u' % (self.address, self.size)
+
+
+default_threshold = 0.01
+
+
+def format_size(n):
+    return '{0:,}B'.format(n)
+
+
+class TreeNode:
+
+    def __init__(self, label=''):
+        self.label = label
+        self.cost = 0
+        self.children = {}
+
+    def write(self, stream, threshold = default_threshold, indent = ''):
+        assert not self.label
+        self._write(stream, indent, threshold, self.cost)
+
+    def _write(self, stream, indent, threshold, total_cost):
+        children = self.children.values()
+        children = [child for child in children if child.cost]
+        children.sort(lambda x, y: cmp(x.cost, y.cost), reverse = True)
+        
+        it = iter(children)
+        for child in it:
+            if abs(child.cost) < threshold * abs(total_cost):
+                nr_pruned = 1
+                pruned_cost = child.cost
+                for child in it:
+                    absolute_cost = child.cost
+                    nr_pruned += 1
+                relative_cost = float(pruned_cost) / float(total_cost)
+                stream.write('%s-> %.2f%% (%s) in %u places, all below the %.2f%% threshold\n' % (indent, 100.0 * relative_cost, format_size(pruned_cost), nr_pruned, 100.0 * threshold))
+                break
+
+            relative_cost = float(child.cost) / float(total_cost)
+            stream.write('%s-> %.2f%% (%s): %s\n' % (indent, 100.0 * relative_cost, format_size(child.cost), child.label))
+            if child is children[-1]:
+               child_indent = indent + '  '
+            else:
+               child_indent = indent + '| '
+
+            child._write(stream, child_indent, threshold, total_cost)
+
+            if child is not children[-1]:
+                stream.write('%s\n' % (child_indent,))
+
+
+class Heap:
+
+    def __init__(self):
+        self.framesSizes = {}
+        self.size = 0
+
+    def add(self, alloc):
+        self._update(alloc.size, alloc.frames)
+
+    def pop(self, alloc):
+        self._update(-alloc.size, alloc.frames)
+
+    def _update(self, ssize, frames):
+        assert frames
+        try:
+            self.framesSizes[frames] += ssize
+        except KeyError:
+            self.framesSizes[frames] = ssize
+        self.size += ssize
+
+    def copy(self):
+        other = Heap()
+        other.framesSizes.update(self.framesSizes)
+        other.size += self.size
+        return other
+
+    def add_heap(self, other):
+        for frames, size in other.framesSizes.iteritems():
+            self._update(size, frames)
+
+    def sub_heap(self, other):
+        for frames, size in other.framesSizes.iteritems():
+            self._update(-size, frames)
+
+    def tree(self, symbolTable):
+        root = TreeNode()
+        for frames, size in self.framesSizes.iteritems():
+            if size == 0:
+                continue
+            root.cost += size
+            parent = root
+            for address in frames:
+                symbol = symbolTable.getSymbol(address)
+                function_id = symbol.id()
+                try:
+                    child = parent.children[function_id]
+                except KeyError:
+                    child = TreeNode(str(symbol))
+                    parent.children[function_id] = child
+                child.cost += size
+                parent = child
+        return root
+
+    def write_profile(self, symbolTable, filename):
+        costs = [
+            {
+                'description': 'Memory',
+                'unit': 'bytes',
+            },
+        ]
+
+        functions = []
+        functionIndices = {}
+
+        callchains = {}
+
+        for frames, size in self.framesSizes.iteritems():
+            if size == 0:
+                continue
+
+            callchain = []
+
+            for address in frames:
+                symbol = symbolTable.getSymbol(address)
+                function_id = symbol.id()
+                try:
+                    functionIndex = functionIndices[function_id]
+                except KeyError:
+                    function_name = symbol.function()
+                    function = {
+                        'name': function_name,
+                    }
+                    if symbol.modulePath is not None:
+                        moduleName = os.path.basename(symbol.modulePath)
+                        if moduleName != 'libmemtrail.so':
+                            function['module'] = moduleName
+                    functionIndex = len(functions)
+                    functionIndices[function_id] = functionIndex
+                    functions.append(function)
+                callchain.append(functionIndex)
+
+            callchain = tuple(callchain)
+
+            try:
+                callchains[callchain] += size
+            except KeyError:
+                callchains[callchain] = size
+
+        events = []
+        for callchain, size in callchains.iteritems():
+            if size == 0:
+                continue
+            if size < 0:
+                if False:
+                    sys.stderr.write('warning: ignoring %s bytes\n' % (size,))
+                    for functionIndex in callchain:
+                        sys.stderr.write('\t%s\n' % functions[functionIndex]['name'])
+                continue
+
+            event = {
+                'callchain': list(callchain),
+                'cost': [size],
+            }
+            events.append(event)
+
+        profile = {
+            'version': 0,
+            'costs': costs,
+            'functions': functions,
+            'events': events,
+        }
+
+        stream = open(filename, 'wt')
+        if True:
+            json.dump(profile, stream, indent=2, sort_keys=True)
+        else:
+            json.dump(profile, stream)
+        stream.write('\n')
+
+        sys.stdout.write('%s written\n' % filename)
+
+
+
+class BaseFilter:
+
+    def __call__(self, alloc, symbolTable):
+        raise NotImplementedError
+
+
+class NoFilter(BaseFilter):
+
+    def __call__(self, alloc, symbolTable):
+        return True
+
+
+class Filter(BaseFilter):
+
+    def __init__(
+        self,
+        include_functions = (),
+        exclude_functions = (),
+        include_modules = (),
+        exclude_modules = (),
+        default=None
+    ):
+
+        self.include_function_re = self._compile(include_functions)
+        self.exclude_function_re = self._compile(exclude_functions)
+        self.include_module_re = self._compile(include_modules)
+        self.exclude_module_re = self._compile(exclude_modules)
+
+        includes = include_functions or include_modules
+        excludes = exclude_functions or exclude_modules
+
+        if default is None:
+            if excludes:
+                if includes:
+                    self.default = True
+                else:
+                    self.default = True
+            else:
+                if includes:
+                    self.default = False
+                else:
+                    self.default = True
+        else:
+            self.default = default
+        self.default = not includes
+
+    def _compile(self, patterns):
+        if patterns:
+            return re.compile('|'.join(patterns))
+        else:
+            return None
+
+    def __call__(self, alloc, symbolTable):
+        for addr in alloc.frames:
+            symbol = symbolTable.getSymbol(addr)
+            if self.include_function_re is not None or self.exclude_function_re is not None:
+                function = symbol.function()
+                if self.include_function_re is not None:
+                    mo = self.include_function_re.search(function)
+                    if mo:
+                        return True
+                if self.exclude_function_re is not None:
+                    mo = self.exclude_function_re.search(function)
+                    if mo:
+                        return False
+            if self.include_module_re is not None or self.exclude_module_re is not None:
+                module = symbol.module
+                if self.include_module_re is not None:
+                    mo = self.include_module_re.search(module.path)
+                    if mo:
+                        return True
+                if self.exclude_module_re is not None:
+                    mo = self.exclude_module_re.search(module.path)
+                    if mo:
+                        return False
+        return self.default
+
+
+def ReadMethod(fmt):
+    # Generate a read_xxx method, precomputing the format size
+    size = struct.calcsize(fmt)
+    def read_fmt(self):
+        return struct.unpack(fmt, self.read(size))
+    return read_fmt
+
+
+class Parser:
+
+    def __init__(self, log):
+        self.log = open(log, 'rb')
+        magic = self.log.read(2)
+        if magic == '\037\213':
+            # gzip file
+            self.log.seek(-4, os.SEEK_END)
+            self.log_size, = struct.unpack('I', self.log.read(4))
+            del self.log
+            gzip = subprocess.Popen(['gzip', '-dc', log], stdout=subprocess.PIPE)
+            self.log = gzip.stdout
+        else:
+            # raw data
+            self.log.seek(0, os.SEEK_END)
+            self.log_size = self.log.tell()
+            assert self.log_size == os.path.getsize(log)
+            self.log.seek(0, os.SEEK_SET)
+        self.log_pos = 0
+
+        self.stamp = 0
+
+        self.modulePaths = {0: None}
+        self.symbolTable = SymbolTable()
+
+    def parse(self):
+        # TODO
+        addrsize = self.read_byte()
+
+        try:
+            while True:
+                self.parse_event()
+        except struct.error:
+            pass
+        except KeyboardInterrupt:
+            sys.stdout.write('\n')
+
+    # ./libmemtrail.so(+0xead)[0x2b54cc593ead]
+    frame_re = re.compile(r'^(?P<module>[^()]*)(?:\((?P<symbol>.*)\+(?P<offset>0x[0-9a-fA-F]+)\))?\[(?P<address>0x[0-9a-fA-F]+)\]$')
+
+    def parse_event(self):
+        self.stamp += 1
+        stamp = self.stamp
+
+        addr, ssize = self.read_event()
+
+        if ssize > 0:
+            frames = self.parse_frames()
+        else:
+            frames = ()
+
+        self.handle_event(stamp, addr, ssize, frames)
+
+        return True
+
+    def parse_frames(self):
+        count, = self.read_byte()
+
+        frames = []
+        for i in range(count):
+            addr, offset, moduleNo = self.read_frame()
+
+            try:
+                modulePath = self.modulePaths[moduleNo]
+            except KeyError:
+                length, = self.read_pointer()
+                modulePath = self.read(length)
+                self.modulePaths[moduleNo] = modulePath
+
+            self.symbolTable.addSymbol(addr, modulePath, offset)
+            frames.append(addr)
+
+        assert frames
+        return tuple(frames)
+
+    def handle_event(self, stamp, addr, ssize, frames):
+        pass
+
+    def progress(self):
+        return self.log_pos*100/self.log_size
+
+    def read(self, size):
+        data = self.log.read(size)
+        self.log_pos += len(data)
+        return data
+
+    read_byte = ReadMethod('B')
+    read_event = ReadMethod('Pl')
+    read_pointer = ReadMethod('P')
+    read_frame = ReadMethod('PPB')
+
+
+class Reporter(Parser):
+
+    def __init__(self, log, filter, options):
+        Parser.__init__(self, log)
+        self.filter = filter
+        self.threshold = options.threshold * 0.01
+        self.show_progress = sys.stdout.isatty()
+        self.show_snapshots = options.show_snapshots
+        self.show_snapshot_deltas = options.show_snapshot_deltas
+        self.show_cum_snapshot_delta = options.show_cum_snapshot_delta
+        self.show_maximum = options.show_maximum
+        self.show_leaks = options.show_leaks
+        self.output_json = options.output_json
+        
+        self.allocs = {}
+        self.size = 0
+        self.max_heap = Heap()
+        self.delta_heap = Heap()
+        self.last_snapshot_heap = None
+        self.cum_snapshot_delta_heap = Heap()
+
+    def parse(self):
+        Parser.parse(self)
+        self.on_finish()
+
+    def handle_event(self, stamp, addr, ssize, frames):
+        if addr == 0:
+            # Snapshot
+            assert ssize == 0
+            self.on_snapshot()
+        elif ssize >= 0:
+            # Allocation
+            alloc = Allocation(addr, ssize, frames)
+            if self.filter(alloc, self.symbolTable):
+                assert alloc.address not in self.allocs
+                self.allocs[alloc.address] = alloc
+                self.size += alloc.size
+                self.delta_heap.add(alloc)
+            else:
+                return True
+        else:
+            # Free
+            try:
+                alloc = self.allocs.pop(addr)
+            except KeyError:
+                return
+
+            if self.show_maximum and self.size > self.max_heap.size:
+                self.max_heap.add_heap(self.delta_heap)
+                self.delta_heap = Heap()
+
+            assert alloc.size == -ssize
+            self.delta_heap.pop(alloc)
+            self.size -= alloc.size
+
+        self.on_update(stamp)
+
+    interval = 1000
+
+    last_stamp = 0
+
+    def on_update(self, stamp):
+        if self.show_progress:
+            assert stamp >= self.last_stamp
+            if stamp >= self.last_stamp + self.interval:
+                progress = self.progress()
+                kb = (self.size + 1024 - 1)/1024
+                sys.stdout.write('%3d%% %8d KB\n' % (progress, kb))
+                sys.stdout.flush()
+                self.last_stamp = stamp
+
+    snapshot_no = 0
+
+    def on_snapshot(self):
+        if self.show_snapshots or self.show_snapshot_deltas or self.show_cum_snapshot_delta:
+            heap = self.max_heap.copy()
+            heap.add_heap(self.delta_heap)
+
+            label = 'snapshot-%u' % self.snapshot_no
+
+            if self.show_snapshots:
+                self.report_heap(label, heap)
+
+            if self.show_snapshot_deltas or self.show_cum_snapshot_delta:
+                last_snapshot_heap = self.last_snapshot_heap
+                self.last_snapshot_heap = heap
+
+                if last_snapshot_heap is not None:
+                    delta_heap = heap.copy()
+                    delta_heap.sub_heap(last_snapshot_heap)
+                    if self.show_snapshot_deltas:
+                        self.report_heap(label + '-delta', delta_heap)
+                    if self.show_cum_snapshot_delta:
+                        self.cum_snapshot_delta_heap.add_heap(delta_heap)
+        
+        self.snapshot_no += 1
+
+    def on_finish(self):
+        if self.show_progress:
+            sys.stdout.write('\n')
+        if self.show_cum_snapshot_delta:
+            self.report_heap('cum-snapshot-delta', self.cum_snapshot_delta_heap)
+        if self.show_maximum:
+            self.report_heap('maximum', self.max_heap)
+        if self.show_leaks:
+            heap = self.max_heap
+            heap.add_heap(self.delta_heap)
+            self.report_heap('leaked', heap)
+
+    def report_heap(self, label, heap):
+        if self.show_progress:
+            sys.stdout.write('\n')
+        sys.stdout.write('%s: %s\n' % (label, format_size(heap.size)))
+        if heap.size:
+            tree = heap.tree(self.symbolTable)
+            tree.write(sys.stdout, threshold = self.threshold, indent='  ')
+            if self.output_json:
+                sys.stdout.flush()
+                heap.write_profile(self.symbolTable, 'memtrail.%s.json' % label)
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+
+
+def report(args):
+    '''Read memtrail.data (created by memtrail record) and report the allocations'''
+
+    optparser = OptionParser(
+        usage="\n\t%prog report [options]")
+    optparser.add_option(
+        '-i', '--include-function', metavar='PATTERN',
+        type="string",
+        action='append',
+        dest="include_functions", default=[],
+        help="include functions matching the regular expression")
+    optparser.add_option(
+        '-x', '--exclude-function', metavar='PATTERN',
+        type="string",
+        action='append',
+        dest="exclude_functions", default=[],
+        help="exclude functions matching the regular expression")
+    optparser.add_option(
+        '--include-module', metavar='PATTERN',
+        type="string",
+        action='append',
+        dest="include_modules", default=[],
+        help="include modules matching the regular expression")
+    optparser.add_option(
+        '--exclude-module', metavar='PATTERN',
+        type="string",
+        action='append',
+        dest="exclude_modules", default=[],
+        help="exclude modules matching the regular expression")
+    optparser.add_option(
+        '-t', '--threshold', metavar='PERCENTAGE',
+        type="float", dest="threshold", default = default_threshold*100.0,
+        help="eliminate nodes below this threshold [default: %default]")
+    optparser.add_option(
+        '--show-snapshots',
+        action="store_true",
+        dest="show_snapshots", default=False,
+        help="show deltas between heap snapshots")
+    optparser.add_option(
+        '--show-snapshot-deltas',
+        action="store_true",
+        dest="show_snapshot_deltas", default=False,
+        help="show deltas between heap snapshots")
+    optparser.add_option(
+        '--show-cumulative-snapshot-delta',
+        action="store_true",
+        dest="show_cum_snapshot_delta", default=False,
+        help="show cumulative delta between heap snapshots")
+    optparser.add_option(
+        '--show-maximum',
+        action="store_true",
+        dest="show_maximum", default=False,
+        help="show maximum allocation")
+    optparser.add_option(
+        '--show-leaks',
+        action="store_true",
+        dest="show_leaks", default=False,
+        help="show leaked allocations")
+    optparser.add_option(
+        '--output-graphs',
+        action="store_true",
+        dest="output_json", default=False,
+        help="output gprof2dot json graphs")
+    (options, args) = optparser.parse_args(args)
+
+    # Default to showing leaks if nothing else was requested.
+    if not options.show_maximum and \
+       not options.show_snapshots and \
+       not options.show_snapshot_deltas and \
+       not options.show_cum_snapshot_delta:
+        options.show_leaks = True
+
+    if args:
+        optparser.error('wrong number of arguments')
+
+    if options.include_functions or options.exclude_functions or options.include_modules or options.exclude_modules:
+        filter = Filter(
+            options.include_functions,
+            options.exclude_functions,
+            options.include_modules,
+            options.exclude_modules,
+        )
+    else:
+        filter = NoFilter()
+
+    reporter = Reporter(
+        'memtrail.data',
+        filter,
+        options
+    )
+    reporter.parse()
+
+
+##########################################################################
+# dump
+
+
+class Dumper(Parser):
+
+    def handle_event(self, stamp, addr, ssize, frames):
+        sys.stdout.write('%u: 0x%08x %+i\n' % (stamp, addr, ssize))
+        for address in frames:
+            symbol = self.symbolTable.getSymbol(address)
+            sys.stdout.write('\t%s\n' % symbol)
+        sys.stdout.write('\n')
+
+
+def dump(args):
+    '''Read memtrail.data (created by memtrail record) and dump the allocations'''
+
+    optparser = OptionParser(
+        usage="\n\t%prog dump [options]")
+    (options, args) = optparser.parse_args(args)
+
+    if args:
+        optparser.error('wrong number of arguments')
+
+    input = 'memtrail.data'
+
+    dumper = Dumper(input)
+    dumper.parse()
+
+
+##########################################################################
+# help
+
+
+def synopsis():
+    command_names = commands.keys()
+    command_names.sort()
+    for command_name in command_names:
+        yield command_name, commands[command_name].__doc__
+
+
+def help(args):
+    '''Display help information about memtrail'''
+
+    optparser = OptionParser(
+        usage="\n\t%prog help [options] -- command [args] ...")
+    (options, args) = optparser.parse_args(args)
+
+    if not args:
+        optparser.error('insufficient number of arguments')
+
+    command = args.pop(0)
+
+    try:
+        function = commands[command]
+    except KeyError:
+        optparser.error('unknown command %s\n' % command)
+    else:
+        function(['--help'])
+
+
+
+##########################################################################
+# main
+
+
+commands = {
+    'record': record,
+    'report': report,
+    'dump': dump,
+    'help': help,
+}
+
+
+def main():
+    usage = [
+        '\t%prog [options] COMMAND [ARGS ...]',
+        '',
+        'Commands:',
+    ]
+    for name, desc in synopsis():
+        usage.append('    %-10s%s' % (name, desc))
+
+    optparser = OptionParser(usage = '\n' + '\n'.join(usage))
+
+    (options, args) = optparser.parse_args(sys.argv[1:])
+
+    if not args:
+        optparser.error('insufficient number of arguments')
+
+    command = args.pop(0)
+
+    try:
+        function = commands[command]
+    except KeyError:
+        optparser.error('unknown command %s\n' % command)
+    else:
+        function(args)
+
+
+if __name__ == '__main__':
+    main()
+
+
+# vim:set sw=4 ts=4 et:
