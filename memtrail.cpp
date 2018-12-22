@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <signal.h>
 
 #include <malloc.h>
 #include <errno.h>
@@ -418,7 +419,6 @@ static void
 _open(void) {
    if (fd < 0) {
       mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-      printf("open file\n");
       fd = open("memtrail.data", O_WRONLY | O_CREAT | O_TRUNC, mode);
 
       if (fd < 0) {
@@ -915,6 +915,18 @@ memtrail_snapshot(void) {
    fprintf(stderr, "memtrail: snapshot %zi bytes (%+zi bytes)\n", current_total_size, current_delta_size);
 }
 
+void _on_signal(int signal) {
+   if (signal == SIGUSR2) {
+      memtrail_snapshot();
+   } else {
+      fprintf(stderr, "ignore sinal %d\n", signal);
+   }
+}
+
+void _register_signal() {
+   signal(SIGUSR2, _on_signal);
+}
+
 
 /*
  * Constructor/destructor
@@ -928,6 +940,7 @@ on_start(void)
    // Only trace the current process.
    unsetenv("LD_PRELOAD");
    _open();
+   _register_signal();
 
    // Abort when the application allocates half of the physical memory, to
    // prevent the system from slowing down to a halt due to swapping
@@ -954,7 +967,4 @@ on_exit(void)
    // We don't close the fd here, just in case another destructor that deals
    // with memory gets called after us.
 }
-
-
-// vim:set sw=3 ts=3 et:
 

@@ -138,11 +138,20 @@ def _ignore_sigint():
 
 class Module:
 
-    def __init__(self, path):
+    def __init__(self, path, libs):
         self.path = path
         self._path = os.path.abspath(path)
+        self._basename = os.path.basename(self._path)
+        for lib in libs:
+            basename = os.path.basename(lib)
+            if basename == self._basename:
+                self._path = lib
+                break
 
-        self.mime_type = subprocess.check_output(['file', '--dereference', '--brief', '--mime-type', self._path]).strip()
+        if os.path.isfile(self._path) :
+            self.mime_type = subprocess.check_output(['file', '--dereference', '--brief', '--mime-type', self._path]).strip()
+        else :
+            self.mime_type = None
         if self.mime_type not in ('application/x-executable', 'application/x-sharedlib'):
             sys.stderr.write('memtrail: warning: unexpected mime-type %s for %s\n' % (self.mime_type, path))
 
@@ -193,12 +202,14 @@ class Symbol(object):
         'offset',
         '_function',
         '_line',
+        'libs'
     ]
 
-    def __init__(self, addr, modulePath, offset):
+    def __init__(self, addr, modulePath, offset, libs):
         self.addr = addr
         self.modulePath = modulePath
-        
+        self.libs = libs
+
         self.offset = offset
         self._function = None
         self._line = '??:0'
@@ -210,7 +221,7 @@ class Symbol(object):
             try:
                 module = self._moduleCache[self.modulePath]
             except KeyError:
-                module = Module(self.modulePath)
+                module = Module(self.modulePath, self.libs)
             self._moduleCache[self.modulePath] = module
 
             if module:
@@ -249,11 +260,11 @@ class SymbolTable:
     def __init__(self):
         self.symbols = {}
 
-    def addSymbol(self, address, modulePath, offset):
+    def addSymbol(self, address, modulePath, offset, libs):
         try:
             symbol = self.symbols[address]
         except KeyError:
-            self.symbols[address] = Symbol(address, modulePath, offset)
+            self.symbols[address] = Symbol(address, modulePath, offset, libs)
         else:
             assert modulePath == symbol.modulePath
             assert offset == symbol.offset
@@ -548,7 +559,8 @@ def ReadMethod(fmt):
 
 class Parser:
 
-    def __init__(self, log):
+    def __init__(self, log, libs):
+        self.libs = libs
         self.log = open(log, 'rb')
         magic = self.log.read(2)
         if magic == '\037\213':
@@ -615,7 +627,7 @@ class Parser:
                 modulePath = self.read(length)
                 self.modulePaths[moduleNo] = modulePath
 
-            self.symbolTable.addSymbol(addr, modulePath, offset)
+            self.symbolTable.addSymbol(addr, modulePath, offset, self.libs)
             frames.append(addr)
 
         assert frames
@@ -641,7 +653,6 @@ class Parser:
 class Reporter(Parser):
 
     def __init__(self, log, filter, options):
-        Parser.__init__(self, log)
         self.filter = filter
         self.threshold = options.threshold * 0.01
         self.show_progress = sys.stdout.isatty()
@@ -651,13 +662,18 @@ class Reporter(Parser):
         self.show_maximum = options.show_maximum
         self.show_leaks = options.show_leaks
         self.output_json = options.output_json
-        
+
         self.allocs = {}
         self.size = 0
         self.max_heap = Heap()
         self.delta_heap = Heap()
         self.last_snapshot_heap = None
         self.cum_snapshot_delta_heap = Heap()
+        self.libs = []
+        for lib in options.libs:
+            self.libs.append(os.path.basename(lib));
+
+        Parser.__init__(self, log, self.libs)
 
     def parse(self):
         Parser.parse(self)
@@ -732,7 +748,7 @@ class Reporter(Parser):
                         self.report_heap(label + '-delta', delta_heap)
                     if self.show_cum_snapshot_delta:
                         self.cum_snapshot_delta_heap.add_heap(delta_heap)
-        
+
         self.snapshot_no += 1
 
     def on_finish(self):
@@ -759,7 +775,6 @@ class Reporter(Parser):
                 heap.write_profile(self.symbolTable, 'memtrail.%s.json' % label)
             sys.stdout.write('\n')
             sys.stdout.flush()
-
 
 def report(args):
     '''Read memtrail.data (created by memtrail record) and report the allocations'''
@@ -824,6 +839,12 @@ def report(args):
         action="store_true",
         dest="output_json", default=False,
         help="output gprof2dot json graphs")
+    optparser.add_option(
+        '--lib',
+        type="string",
+        action='append',
+        dest="libs", default=[],
+        help="runtime lib")
     (options, args) = optparser.parse_args(args)
 
     # Default to showing leaks if nothing else was requested.
