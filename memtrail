@@ -143,9 +143,9 @@ class Module:
         self._path = os.path.abspath(path)
         self._basename = os.path.basename(self._path)
         for lib in libs:
-            basename = os.path.basename(lib)
-            if basename == self._basename:
-                self._path = lib
+            if self._basename in libs :
+                lib_path = libs[self._basename]
+                self._path = lib_path
                 break
 
         if os.path.isfile(self._path) :
@@ -669,9 +669,9 @@ class Reporter(Parser):
         self.delta_heap = Heap()
         self.last_snapshot_heap = None
         self.cum_snapshot_delta_heap = Heap()
-        self.libs = []
+        self.libs = {}
         for lib in options.libs:
-            self.libs.append(os.path.basename(lib));
+            self.libs[os.path.basename(lib)] = lib;
 
         Parser.__init__(self, log, self.libs)
 
