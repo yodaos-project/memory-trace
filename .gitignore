@@ -1,2 +1,14 @@
 .vscode/
 build/
+.*.sw?
+*.data
+*.dot
+*.json
+*.o
+*.out
+*.pyc
+*.so
+gprof2dot.py
+benchmark
+sample
+
