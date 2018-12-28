@@ -916,7 +916,7 @@ memtrail_snapshot(void) {
 }
 
 void _on_signal(int signal) {
-   if (signal == SIGUSR2) {
+   if (signal == SIGUSR2 || signal == SIGUSR1) {
       memtrail_snapshot();
    } else {
       fprintf(stderr, "ignore sinal %d\n", signal);
@@ -924,6 +924,7 @@ void _on_signal(int signal) {
 }
 
 void _register_signal() {
+   signal(SIGUSR1, _on_signal);
    signal(SIGUSR2, _on_signal);
 }
 
