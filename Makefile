@@ -14,7 +14,7 @@ CFLAGS = -Wall -fno-omit-frame-pointer -fvisibility=hidden -std=c99 $(UNWIND_INC
 all: libmemtrail.so sample-c sample-cpp
 
 libmemtrail.so: memtrail.cpp memtrail.version
-	$(CXX) -O2 -g2 $(CXXFLAGS) -shared -fPIC $(UNWIND_LIBS) -o $@ $<  -ldl
+	$(CXX) -O2 -g2 $(CXXFLAGS) -shared -fPIC $(UNWIND_LIBS) -Wl,--version-script,memtrail.version -o $@ $<  -ldl
 
 %: %.cpp
 	$(CXX) -O0 -g2 -o $@ $< -ldl
